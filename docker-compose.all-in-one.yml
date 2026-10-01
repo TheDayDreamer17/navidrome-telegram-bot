@@ -1,0 +1,35 @@
+version: '3.8'
+
+# Turnkey All-in-One Deployment: Navidrome Server + Telegram Music Bot
+# Usage: docker compose -f docker-compose.all-in-one.yml up -d
+
+services:
+  navidrome:
+    image: deluan/navidrome:latest
+    container_name: navidrome
+    restart: unless-stopped
+    ports:
+      - "4533:4533"
+    environment:
+      ND_PLAYLISTS_PUBLIC: "true"
+      ND_SCANSCHEDULE: "15m"
+      ND_LOGLEVEL: "info"
+      ND_SESSIONTIMEOUT: "720h"
+      ND_MUSICFOLDER: "/music"
+    volumes:
+      - ./data:/data
+      - ${MUSIC_ROOT_DIR:-${HOME}/Music}:/music
+
+  telegram-downloader:
+    build: .
+    container_name: telegram-downloader
+    restart: unless-stopped
+    depends_on:
+      - navidrome
+    env_file:
+      - .env
+    environment:
+      - NAVIDROME_DB_PATH=/navidrome_data/navidrome.db
+    volumes:
+      - ${MUSIC_ROOT_DIR:-${HOME}/Music}:/music
+      - ./data:/navidrome_data

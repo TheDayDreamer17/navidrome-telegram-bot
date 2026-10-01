@@ -1,0 +1,35 @@
+# Secrets & Environment variables
+.env
+*.env
+*.env.*
+!.env.example
+
+# Temporary test scripts
+test.py
+
+# Python runtime artifacts
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+env/
+venv/
+ENV/
+build/
+dist/
+*.egg-info/
+
+# Operating System artifacts
+.DS_Store
+.DS_Store?
+._*
+.Spotlight-V100
+.Trashes
+Thumbs.db
+
+# Editor configurations
+.vscode/
+.idea/
+*.swp
+*.swo

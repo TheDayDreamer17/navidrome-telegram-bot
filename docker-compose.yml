@@ -1,0 +1,10 @@
+services:
+  telegram-downloader:
+    build: .
+    container_name: telegram-downloader
+    restart: unless-stopped
+    env_file:
+      - .env
+    volumes:
+      - ${MUSIC_ROOT_DIR:-${HOME}/Music}:/music
+      - ${NAVIDROME_DATA_DIR:-../navidrome/data}:/navidrome_data
