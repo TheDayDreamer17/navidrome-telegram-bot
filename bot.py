@@ -14,6 +14,7 @@ from pathlib import Path
 from curl_cffi import requests
 from bs4 import BeautifulSoup
 from playwright.async_api import async_playwright
+from ytmusicapi import YTMusic
 
 from telegram import (
     Update,
@@ -313,33 +314,152 @@ def find_existing_track_for_query(query: str, downloads_dir: Path, library_dir: 
     return None
 
 
-# --- YouTube Search & Download Helpers ---
-def search_youtube_candidates(query: str, limit: int = 4) -> list[dict]:
+# --- Clean Audio / Studio Track Filter Patterns ---
+BAD_TITLE_PATTERNS = [
+    r"\b(official\s+)?music\s+video\b",
+    r"\bofficial\s+video\b",
+    r"\bvideo\s+song\b",
+    r"\bfull\s+video\b",
+    r"\blyric(s)?\s+video\b",
+    r"\blo-?fi(\s+flip|\s+mix|\s+remix)?\b",
+    r"\bslowed(\s*\+\s*reverb)?\b",
+    r"\breverb\b",
+    r"\b8d(\s+audio)?\b",
+    r"\bnightcore\b",
+    r"\bspeed\s*up\b",
+    r"\bsped\s*up\b",
+    r"\bbass\s*boosted\b",
+    r"\bteaser\b",
+    r"\btrailer\b",
+    r"\bpromo\b",
+    r"\breaction\b",
+    r"\bstatus\b",
+    r"\bshorts\b",
+    # Jukeboxes & Multi-song Compilations
+    r"\b(full\s+)?(audio\s+|video\s+)?jukebox\b",
+    r"\b(full\s+)?album\s+jukebox\b",
+    r"\bfull\s+album\b",
+    r"\ball\s+songs\b",
+    r"\bnon\s*stop\b",
+    r"\bjukebox\b",
+    r"\bcompilation\b",
+]
+
+
+def is_clean_studio_track(title: str, artists: str = "", user_query: str = "") -> bool:
+    """Filters out noisy music videos, lofi flips, slowed+reverb, and promos unless specifically asked for."""
+    combined = f"{title.lower()} {artists.lower()}"
+    query_lower = user_query.lower()
+    for pattern in BAD_TITLE_PATTERNS:
+        if re.search(pattern, query_lower):
+            continue
+        if re.search(pattern, combined):
+            return False
+    return True
+
+
+def clean_display_title(title: str) -> str:
+    """Removes bracketed fluff like '[Official Audio]' or '(Audio)' from song titles."""
+    cleaned = re.sub(r'[\(\[\{]\s*(?:official\s+)?audio(?:\s+song)?\s*[\)\]\}]', '', title, flags=re.IGNORECASE)
+    cleaned = re.sub(r'\|\s*(?:official\s+)?audio(?:\s+song)?', '', cleaned, flags=re.IGNORECASE)
+    return cleaned.strip()
+
+
+# --- YouTube Music Search & Download Helpers ---
+def search_youtube_candidates(query: str, limit: int = 10) -> list[dict]:
+    """
+    Searches YouTube Music for official studio songs, filtering out modified music videos.
+    Returns up to 'limit' (default 10) results with full song title, singers, album, and duration.
+    """
+    candidates: list[dict] = []
+
+    # 1. Primary: YouTube Music API (Clean Official Studio Songs)
+    try:
+        yt = YTMusic()
+        results = yt.search(query, filter="songs", limit=max(25, limit * 2))
+        for r in results:
+            vid = r.get("videoId")
+            title = (r.get("title") or "").strip()
+            artists = ", ".join([a["name"] for a in r.get("artists", [])]) or "Unknown Artist"
+            dur = r.get("duration") or "Unknown"
+            album = r.get("album", {}).get("name") if r.get("album") else ""
+
+            if not vid or not title:
+                continue
+
+            if not is_clean_studio_track(title, artists, query):
+                continue
+
+            # Filter out short teasers (< 45s) and long jukeboxes/compilations (> 10 mins)
+            if dur and ":" in dur:
+                parts = dur.split(":")
+                try:
+                    if len(parts) == 2:
+                        m, s = int(parts[0]), int(parts[1])
+                        if m < 1 and s < 45:
+                            continue
+                        if m >= 10:  # 10 minutes or longer = jukebox / compilation
+                            continue
+                    elif len(parts) >= 3:  # 1 hour or longer
+                        continue
+                except ValueError:
+                    pass
+
+            candidates.append({
+                "id": vid,
+                "title": clean_display_title(title),
+                "artists": artists,
+                "channel": artists,
+                "album": album,
+                "duration": dur,
+            })
+            if len(candidates) >= limit:
+                break
+    except Exception as e:
+        logger.warning(f"[Search] YTMusic search failed, falling back to yt-dlp: {e}")
+
+    if candidates:
+        return candidates
+
+    # 2. Fallback: yt-dlp search with audio filter
     cmd = [
         "yt-dlp",
         "--skip-download",
         "--dump-single-json",
         "--flat-playlist",
-        f"ytsearch{limit}:{query}",
+        f"ytsearch25:{query} official audio",
     ]
     proc = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
-    if proc.returncode != 0 or not proc.stdout:
-        return []
-    try:
-        data = json.loads(proc.stdout)
-        candidates = []
-        for entry in data.get("entries", []):
-            duration = int(entry.get("duration") or 0)
-            mins, secs = divmod(duration, 60)
-            candidates.append({
-                "id": entry.get("id"),
-                "title": entry.get("title", "Unknown Title"),
-                "channel": entry.get("channel") or entry.get("uploader", "Unknown Artist"),
-                "duration": f"{mins}:{secs:02d}" if duration else "Live/Unknown",
-            })
-        return candidates
-    except Exception:
-        return []
+    if proc.returncode == 0 and proc.stdout:
+        try:
+            data = json.loads(proc.stdout)
+            for entry in data.get("entries", []):
+                vid = entry.get("id")
+                title = (entry.get("title") or "").strip()
+                channel = (entry.get("channel") or entry.get("uploader") or "Unknown Artist").replace(" - Topic", "").strip()
+                duration = int(entry.get("duration") or 0)
+                mins, secs = divmod(duration, 60)
+                dur_str = f"{mins}:{secs:02d}" if duration else "Unknown"
+
+                if not vid or not title or duration < 45 or duration > 600:
+                    continue
+                if not is_clean_studio_track(title, channel, query):
+                    continue
+
+                candidates.append({
+                    "id": vid,
+                    "title": clean_display_title(title),
+                    "artists": channel,
+                    "channel": channel,
+                    "album": "",
+                    "duration": dur_str,
+                })
+                if len(candidates) >= limit:
+                    break
+        except Exception:
+            pass
+
+    return candidates
 
 
 def download_specific_track(video_id: str, target_dir: Path) -> tuple[bool, str, list[str]]:
@@ -362,6 +482,157 @@ def download_specific_track(video_id: str, target_dir: Path) -> tuple[bool, str,
     after = list_audio_files(target_dir)
     new_files = [f.name for f in (after - before)]
     return True, "Track downloaded successfully!", new_files
+
+
+def extract_audio_preview(video_id: str) -> Path | None:
+    """Extracts a fast 30s audio sample using ffmpeg for Telegram in-chat preview."""
+    out_path = Path(f"/tmp/preview_{video_id}.mp3")
+    if out_path.exists() and out_path.stat().st_size > 10000:
+        return out_path
+    out_path.unlink(missing_ok=True)
+    url = f"https://www.youtube.com/watch?v={video_id}"
+    cmd = [
+        "yt-dlp",
+        "-x",
+        "--audio-format", "mp3",
+        "--downloader", "ffmpeg",
+        "--downloader-args", "ffmpeg_i:-ss 00:00:30 -t 30",
+        "-o", str(out_path),
+        url,
+    ]
+    try:
+        proc = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, timeout=35)
+        if proc.returncode == 0 and out_path.exists() and out_path.stat().st_size > 10000:
+            return out_path
+    except Exception as e:
+        logger.error(f"Failed to generate audio preview for {video_id}: {e}")
+    return None
+
+
+def search_albums_and_playlists(query: str, limit: int = 5) -> list[dict]:
+    """Searches YouTube Music for official Albums and Playlists."""
+    clean_q = re.sub(r'\b(playlist|album|songs|full|ost|soundtrack)\b', '', query, flags=re.IGNORECASE).strip()
+    if not clean_q:
+        clean_q = query
+
+    results = []
+    yt = YTMusic()
+    try:
+        albums = yt.search(clean_q, filter="albums", limit=limit)
+        for a in albums:
+            browse_id = a.get("browseId")
+            title = a.get("title", "Unknown Album")
+            artists = ", ".join([ar["name"] for ar in a.get("artists", [])]) or "Various Artists"
+            year = a.get("year", "")
+            type_ = a.get("type", "Album")
+            if browse_id:
+                results.append({
+                    "kind": "album",
+                    "id": browse_id,
+                    "title": title,
+                    "artists": artists,
+                    "year": year,
+                    "type": type_,
+                })
+    except Exception as e:
+        logger.warning(f"[Search] Album search error: {e}")
+
+    try:
+        playlists = yt.search(clean_q, filter="playlists", limit=limit)
+        for p in playlists:
+            browse_id = p.get("browseId")
+            title = p.get("title", "Unknown Playlist")
+            author = p.get("author", "")
+            count = p.get("itemCount")
+            if browse_id:
+                results.append({
+                    "kind": "playlist",
+                    "id": browse_id,
+                    "title": title,
+                    "artists": author,
+                    "count": count,
+                    "type": "Playlist",
+                })
+    except Exception as e:
+        logger.warning(f"[Search] Playlist search error: {e}")
+
+    return results
+
+
+async def download_album_or_playlist_job(kind: str, browse_id: str, user_id: int, status_msg) -> str:
+    """Downloads all tracks from an album/playlist as separate songs and generates an .m3u playlist."""
+    user_root, downloads_dir, library_dir = get_user_paths(user_id)
+    downloads_dir.mkdir(parents=True, exist_ok=True)
+    library_dir.mkdir(parents=True, exist_ok=True)
+
+    loop = asyncio.get_running_loop()
+    yt = YTMusic()
+
+    if kind == "album":
+        data = await loop.run_in_executor(None, yt.get_album, browse_id)
+    else:
+        data = await loop.run_in_executor(None, yt.get_playlist, browse_id)
+
+    if not data or not data.get("tracks"):
+        return "❌ Could not fetch album or playlist tracks."
+
+    collection_title = data.get("title") or "Album Playlist"
+    tracks = data.get("tracks", [])
+    total_tracks = len(tracks)
+
+    import html
+    await status_msg.edit_text(
+        f"💿 <b>Found {kind.capitalize()}: '{html.escape(collection_title)}'</b> ({total_tracks} tracks).\n"
+        f"⚡ Downloading individual studio songs into <code>downloads/</code>...",
+        parse_mode="HTML"
+    )
+
+    m3u_entries = []
+    new_downloads_count = 0
+
+    for idx, t in enumerate(tracks, 1):
+        vid = t.get("videoId")
+        title = t.get("title") or f"Track {idx}"
+        artists = ", ".join([a["name"] for a in t.get("artists", [])]) if t.get("artists") else ""
+        q = f"{artists} - {title}" if artists else title
+
+        existing = find_existing_track_for_query(q, downloads_dir, library_dir)
+        if existing:
+            m3u_entries.append(existing)
+            continue
+
+        if idx % 2 == 0 or idx == 1 or idx == total_tracks:
+            try:
+                await status_msg.edit_text(
+                    f"⏳ Downloading <b>{html.escape(collection_title)}</b>: <b>{idx}/{total_tracks}</b> tracks...\n"
+                    f"Current: <i>{html.escape(q)}</i>",
+                    parse_mode="HTML"
+                )
+            except Exception:
+                pass
+
+        if vid:
+            ok, _, new_f = await loop.run_in_executor(None, download_specific_track, vid, downloads_dir)
+            if ok and new_f:
+                m3u_entries.append(new_f[0])
+                new_downloads_count += len(new_f)
+                continue
+
+        # Fallback to single search
+        new_f = await loop.run_in_executor(None, download_ytsearch_single, q, downloads_dir)
+        if new_f:
+            m3u_entries.append(new_f[0])
+            new_downloads_count += len(new_f)
+
+    create_m3u_playlist(collection_title, downloads_dir, m3u_entries)
+    return (
+        f"✅ <b>{kind.capitalize()} Downloaded Successfully!</b>\n\n"
+        f"💿 <b>{html.escape(collection_title)}</b>\n"
+        f"🎵 <b>Total tracks:</b> {len(m3u_entries)} / {total_tracks}\n"
+        f"📥 <b>Newly downloaded:</b> {new_downloads_count} songs\n"
+        f"📜 Playlist saved to <code>downloads/{sanitize_filename(collection_title)}.m3u</code>\n\n"
+        f"💡 <i>Tip: No jukeboxes! Each song is saved separately and tagged.</i>"
+    )
 
 
 def download_ytsearch_single(track_query: str, target_dir: Path) -> list[str]:
@@ -739,69 +1010,66 @@ def discover_new_song_sync(user_id: int) -> tuple[bool, str]:
     top_pool = seed_tracks[: min(8, len(seed_tracks))]
     random.shuffle(top_pool)
 
+    yt = YTMusic()
     for seed in top_pool:
         logger.info(f"[Discover] Trying seed track: '{seed}'")
-        seed_results = search_youtube_candidates(seed, limit=1)
-        if not seed_results or not seed_results[0].get("id"):
-            continue
-
-        seed_vid = seed_results[0]["id"]
-        mix_url = f"https://www.youtube.com/watch?v={seed_vid}&list=RD{seed_vid}"
-        mix_cmd = [
-            "yt-dlp",
-            "--skip-download",
-            "--dump-single-json",
-            "--flat-playlist",
-            "--playlist-end", "25",
-            mix_url,
-        ]
-        proc = subprocess.run(mix_cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
-        if proc.returncode != 0 or not proc.stdout:
-            continue
-
         try:
-            mix_data = json.loads(proc.stdout)
-            entries = mix_data.get("entries") or []
-        except Exception:
+            seed_results = yt.search(seed, filter="songs", limit=3)
+            if not seed_results or not seed_results[0].get("videoId"):
+                continue
+
+            seed_vid = seed_results[0]["videoId"]
+            watch = yt.get_watch_playlist(videoId=seed_vid, limit=30)
+            raw_tracks = watch.get("tracks", [])
+            if not raw_tracks:
+                continue
+
+            candidates = raw_tracks[1:] if len(raw_tracks) > 1 else raw_tracks
+            random.shuffle(candidates)
+
+            for entry in candidates:
+                vid = entry.get("videoId")
+                title = clean_display_title((entry.get("title") or "").strip())
+                artists = ", ".join([a["name"] for a in entry.get("artists", [])]) or "Unknown Artist"
+                dur = entry.get("length") or ""
+                album = entry.get("album", {}).get("name") if entry.get("album") else ""
+
+                if not vid or not title or vid == seed_vid:
+                    continue
+                if not is_clean_studio_track(title, artists):
+                    continue
+
+                norm_title = normalize_text(title)
+                norm_full = normalize_text(f"{artists} {title}")
+                if any(
+                    norm_title in ex or ex in norm_title or norm_full in ex
+                    for ex in existing_norms
+                    if len(ex) >= 4
+                ):
+                    continue
+
+                logger.info(f"[Discover] Selected clean recommendation: '{artists} - {title}' ({vid}) from seed '{seed}'")
+                ok, err, new_files = download_specific_track(vid, downloads_dir)
+                if ok and new_files:
+                    for nf in new_files:
+                        append_to_m3u_playlist("Daily Discovery", downloads_dir, nf)
+                    album_str = f" • 💿 _{album}_" if album else ""
+                    dur_str = f"⏱️ {dur}" if dur else ""
+                    details = f"{dur_str}{album_str}".strip(" • ")
+                    details_line = f"ℹ️ {details}\n" if details else ""
+                    return (
+                        True,
+                        f"✨ **New Discovery Added!**\n\n"
+                        f"🎧 **Based on your taste:** _{seed}_\n"
+                        f"🎵 **Song:** **{title}**\n"
+                        f"🎤 **Singer(s):** *{artists}*\n"
+                        f"{details_line}"
+                        f"📂 Added to `Daily Discovery.m3u` in `downloads/`\n\n"
+                        f"💡 _Tip: ❤️ Star it in Navidrome to move to permanent `library/`, or rate 1⭐ to remove._",
+                    )
+        except Exception as e:
+            logger.warning(f"[Discover] Error querying radio for seed '{seed}': {e}")
             continue
-
-        candidates = entries[1:] if len(entries) > 1 else entries
-        random.shuffle(candidates)
-
-        for entry in candidates:
-            vid = entry.get("id")
-            title = (entry.get("title") or "").strip()
-            channel = (entry.get("channel") or entry.get("uploader") or "").replace(" - Topic", "").strip()
-            duration = int(entry.get("duration") or 0)
-
-            if not vid or not title or vid == seed_vid:
-                continue
-            if duration and (duration > 540 or duration < 60):
-                continue
-
-            norm_title = normalize_text(title)
-            norm_full = normalize_text(f"{channel} {title}")
-            if any(
-                norm_title in ex or ex in norm_title or norm_full in ex
-                for ex in existing_norms
-                if len(ex) >= 4
-            ):
-                continue
-
-            logger.info(f"[Discover] Selected recommendation: '{channel} - {title}' ({vid}) from seed '{seed}'")
-            ok, err, new_files = download_specific_track(vid, downloads_dir)
-            if ok and new_files:
-                for nf in new_files:
-                    append_to_m3u_playlist("Daily Discovery", downloads_dir, nf)
-                display_name = f"{channel} - {title}" if channel and channel.lower() not in title.lower() else title
-                return (
-                    True,
-                    f"✨ **New Discovery Added!**\n\n"
-                    f"🎧 **Based on:** _{seed}_\n"
-                    f"🎵 **Downloaded:** **{display_name}**\n"
-                    f"📂 Added to `Daily Discovery.m3u` in `downloads/`\n\n"
-                    f"💡 _Tip: ❤️ Star it in Navidrome to move to permanent `library/`, or rate 1⭐ to remove._",
-                )
 
     return False, "Could not find a new recommendation right now. Try again later!"
 
@@ -996,23 +1264,87 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await status_msg.edit_text(f"❌ Failed: {log}")
         return
 
-    # 2. Text Search with Inline Buttons
-    status_msg = await update.message.reply_text(f"🔎 Searching YouTube for '{text}'...", reply_markup=MAIN_REPLY_KEYBOARD)
+    # 2. Text Search (Album/Playlist or Single Songs)
+    lower_text = text.lower()
+    is_album_query = any(k in lower_text for k in ["playlist", "album", "full album", "ost", "soundtrack"])
+
+    # If user explicitly asked for an album/playlist, search collections first
+    if is_album_query:
+        status_msg = await update.message.reply_text(f"🔎 Searching for Album/Playlist '{text}'...", reply_markup=MAIN_REPLY_KEYBOARD)
+        loop = asyncio.get_running_loop()
+        collections = await loop.run_in_executor(None, search_albums_and_playlists, text, 4)
+
+        if collections:
+            context.user_data["collections"] = {c["id"]: c for c in collections}
+            import html
+            col_lines = [f"💿 <b>Albums / Playlists matching:</b> <i>{html.escape(text)}</i>\n"]
+            col_keyboard = []
+            for idx, c in enumerate(collections, 1):
+                col_lines.append(f"<b>{idx}.</b> {html.escape(c['title'])} <i>({html.escape(c['artists'])})</i> [{c['type']}]")
+                col_keyboard.append([
+                    InlineKeyboardButton(f"⬇️ Download {c['type']} #{idx}: {c['title'][:25]}", callback_data=f"dl_col:{c['kind']}:{c['id']}")
+                ])
+            col_keyboard.append([InlineKeyboardButton("🎵 Search Single Songs Instead", callback_data=f"search_songs:{text[:30]}")])
+            col_keyboard.append([InlineKeyboardButton("❌ Cancel", callback_data="cancel")])
+
+            await status_msg.edit_text(
+                "\n".join(col_lines),
+                reply_markup=InlineKeyboardMarkup(col_keyboard),
+                parse_mode="HTML"
+            )
+            return
+
+    # 3. Standard Clean Studio Songs Search (Up to 10 Songs with Previews)
+    status_msg = await update.message.reply_text(f"🔎 Searching YouTube Music for '{text}'...", reply_markup=MAIN_REPLY_KEYBOARD)
     loop = asyncio.get_running_loop()
-    candidates = await loop.run_in_executor(None, search_youtube_candidates, text, 4)
+    candidates = await loop.run_in_executor(None, search_youtube_candidates, text, 10)
 
     if not candidates:
-        await status_msg.edit_text(f"No results found for '{text}'.")
+        await status_msg.edit_text(f"❌ No clean studio tracks found for '{text}'.")
         return
 
     context.user_data["candidates"] = {c["id"]: c for c in candidates}
-    keyboard = []
-    for c in candidates:
-        button_text = f"🎵 {c['title'][:32]}... ({c['duration']})"
-        keyboard.append([InlineKeyboardButton(button_text, callback_data=f"dl:{c['id']}")])
-    keyboard.append([InlineKeyboardButton("❌ Cancel", callback_data="cancel")])
 
-    await status_msg.edit_text("Select the track to download:", reply_markup=InlineKeyboardMarkup(keyboard))
+    import html
+    number_emojis = ["1️⃣", "2️⃣", "3️⃣", "4️⃣", "5️⃣", "6️⃣", "7️⃣", "8️⃣", "9️⃣", "🔟"]
+    msg_lines = [f"🔎 <b>Search Results for:</b> <i>{html.escape(text)}</i>\n"]
+    keyboard = []
+    dl_row1, dl_row2 = [], []
+    prev_row1, prev_row2 = [], []
+
+    for idx, c in enumerate(candidates):
+        num = number_emojis[idx] if idx < len(number_emojis) else f"#{idx+1}"
+        title_esc = html.escape(c["title"])
+        singers = c.get("artists") or c.get("channel") or "Unknown Artist"
+        singers_esc = html.escape(singers)
+        dur_str = f" • ⏱️ {html.escape(c['duration'])}" if c.get("duration") else ""
+        album_str = f" • 💿 <i>{html.escape(c['album'])}</i>" if c.get("album") else ""
+
+        msg_lines.append(f"{num} <b>{title_esc}</b>\n   🎤 <i>{singers_esc}</i>{dur_str}{album_str}\n")
+
+        # Download button
+        target_dl = dl_row1 if idx < 5 else dl_row2
+        target_dl.append(InlineKeyboardButton(f"⬇️ {num}", callback_data=f"dl:{c['id']}"))
+
+        # Preview button
+        target_prev = prev_row1 if idx < 5 else prev_row2
+        target_prev.append(InlineKeyboardButton(f"🎧 {num}", callback_data=f"prev:{c['id']}"))
+
+    msg_lines.append("<i>Tap ⬇️ to download full song, or 🎧 to hear a 30s preview first!</i>")
+
+    keyboard.append(dl_row1)
+    if dl_row2:
+        keyboard.append(dl_row2)
+    keyboard.append(prev_row1)
+    if prev_row2:
+        keyboard.append(prev_row2)
+    keyboard.append([InlineKeyboardButton("❌ Cancel Search", callback_data="cancel")])
+
+    await status_msg.edit_text(
+        "\n".join(msg_lines),
+        reply_markup=InlineKeyboardMarkup(keyboard),
+        parse_mode="HTML"
+    )
 
 
 async def handle_button(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -1058,6 +1390,87 @@ async def handle_button(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await help_command(update, context)
         return
 
+    # --- Search Single Songs Fallback from Album view ---
+    if data.startswith("search_songs:"):
+        search_query = data.split(":", 1)[1]
+        loop = asyncio.get_running_loop()
+        candidates = await loop.run_in_executor(None, search_youtube_candidates, search_query, 10)
+        if not candidates:
+            await query.edit_message_text(f"❌ No clean studio tracks found for '{search_query}'.")
+            return
+        context.user_data["candidates"] = {c["id"]: c for c in candidates}
+        import html
+        number_emojis = ["1️⃣", "2️⃣", "3️⃣", "4️⃣", "5️⃣", "6️⃣", "7️⃣", "8️⃣", "9️⃣", "🔟"]
+        msg_lines = [f"🔎 <b>Search Results for:</b> <i>{html.escape(search_query)}</i>\n"]
+        keyboard, dl1, dl2, pr1, pr2 = [], [], [], [], []
+        for idx, c in enumerate(candidates):
+            num = number_emojis[idx] if idx < len(number_emojis) else f"#{idx+1}"
+            title_esc = html.escape(c["title"])
+            singers = c.get("artists") or c.get("channel") or "Unknown Artist"
+            dur_str = f" • ⏱️ {html.escape(c['duration'])}" if c.get("duration") else ""
+            msg_lines.append(f"{num} <b>{title_esc}</b>\n   🎤 <i>{html.escape(singers)}</i>{dur_str}\n")
+            target_dl = dl1 if idx < 5 else dl2
+            target_dl.append(InlineKeyboardButton(f"⬇️ {num}", callback_data=f"dl:{c['id']}"))
+            target_pr = pr1 if idx < 5 else pr2
+            target_pr.append(InlineKeyboardButton(f"🎧 {num}", callback_data=f"prev:{c['id']}"))
+        keyboard.append(dl1)
+        if dl2: keyboard.append(dl2)
+        keyboard.append(pr1)
+        if pr2: keyboard.append(pr2)
+        keyboard.append([InlineKeyboardButton("❌ Cancel", callback_data="cancel")])
+        await query.edit_message_text("\n".join(msg_lines), reply_markup=InlineKeyboardMarkup(keyboard), parse_mode="HTML")
+        return
+
+    # --- Album / Playlist Download Selection ---
+    if data.startswith("dl_col:"):
+        _, kind, browse_id = data.split(":", 2)
+        status_msg = await query.message.reply_text("⏳ Preparing album download...", reply_markup=MAIN_REPLY_KEYBOARD)
+        result = await download_album_or_playlist_job(kind, browse_id, user_id, status_msg)
+        await status_msg.edit_text(result, parse_mode="HTML")
+        return
+
+    # --- 30s Audio Preview Callback ---
+    if data.startswith("prev:"):
+        video_id = data.split(":", 1)[1]
+        candidates = context.user_data.get("candidates", {})
+        cand_info = candidates.get(video_id, {})
+        title = cand_info.get("title", "Song Preview")
+        singers = cand_info.get("artists") or cand_info.get("channel") or "Unknown Artist"
+
+        import html
+        title_esc = html.escape(title)
+        singers_esc = html.escape(singers)
+
+        status_msg = await query.message.reply_text(f"⏳ Generating 30s preview for <b>{title_esc}</b>...", parse_mode="HTML")
+        loop = asyncio.get_running_loop()
+        preview_file = await loop.run_in_executor(None, extract_audio_preview, video_id)
+
+        if preview_file and preview_file.exists():
+            await status_msg.delete()
+            try:
+                with open(preview_file, "rb") as audio_fh:
+                    await context.bot.send_audio(
+                        chat_id=user_id,
+                        audio=audio_fh,
+                        title=f"Sample: {title[:50]}",
+                        performer=singers[:50],
+                        duration=30,
+                        caption=(
+                            f"🎧 <b>Preview (30s):</b> <b>{title_esc}</b>\n"
+                            f"🎤 <i>{singers_esc}</i>\n\n"
+                            f"<i>Tap below if you want to download the complete song!</i>"
+                        ),
+                        parse_mode="HTML",
+                        reply_markup=InlineKeyboardMarkup([
+                            [InlineKeyboardButton("⬇️ Download Full Song to Library", callback_data=f"dl:{video_id}")]
+                        ])
+                    )
+            finally:
+                preview_file.unlink(missing_ok=True)
+        else:
+            await status_msg.edit_text(f"⚠️ Could not generate audio preview for <b>{title_esc}</b>.", parse_mode="HTML")
+        return
+
     # --- Track Download Selection ---
     if data == "cancel":
         await query.edit_message_text("Download canceled.")
@@ -1066,16 +1479,45 @@ async def handle_button(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if data.startswith("dl:"):
         video_id = data.split(":", 1)[1]
         candidates = context.user_data.get("candidates", {})
-        selected_song = candidates.get(video_id, {}).get("title", "Selected Track")
+        cand_info = candidates.get(video_id, {})
+        title = cand_info.get("title", "Selected Track")
+        singers = cand_info.get("artists") or cand_info.get("channel") or ""
+        dur = cand_info.get("duration", "")
+        album = cand_info.get("album", "")
 
-        await query.edit_message_text(f"⬇️ Downloading: '{selected_song}'...")
+        import html
+        title_esc = html.escape(title)
+        singers_esc = html.escape(singers)
+
+        await query.edit_message_text(
+            f"⬇️ Downloading: <b>{title_esc}</b> by <i>{singers_esc}</i>...",
+            parse_mode="HTML"
+        )
         loop = asyncio.get_running_loop()
-        success, log, _ = await loop.run_in_executor(None, download_specific_track, video_id, downloads_dir)
+        success, log, new_files = await loop.run_in_executor(None, download_specific_track, video_id, downloads_dir)
 
-        if success:
-            await query.edit_message_text(f"✅ Done! Downloaded '{selected_song}' to `downloads/`.")
+        if success and new_files:
+            dur_line = f"⏱️ <b>Duration:</b> {html.escape(dur)}\n" if dur else ""
+            album_line = f"💿 <b>Album:</b> <i>{html.escape(album)}</i>\n" if album else ""
+            await query.edit_message_text(
+                f"✅ <b>Downloaded Successfully!</b>\n\n"
+                f"🎵 <b>Song:</b> <b>{title_esc}</b>\n"
+                f"🎤 <b>Singer(s):</b> <i>{singers_esc}</i>\n"
+                f"{dur_line}{album_line}"
+                f"📂 Saved to <code>downloads/{html.escape(new_files[0])}</code>\n\n"
+                f"💡 <i>Tip: ❤️ Star it in Navidrome to move to permanent <code>library/</code>.</i>",
+                parse_mode="HTML"
+            )
+        elif success:
+            await query.edit_message_text(
+                f"✅ <b>{title_esc}</b> by <i>{singers_esc}</i> already exists in your library or downloads.",
+                parse_mode="HTML"
+            )
         else:
-            await query.edit_message_text(f"❌ Failed to download: {log}")
+            await query.edit_message_text(
+                f"❌ Failed to download <b>{title_esc}</b>:\n<code>{html.escape(log)}</code>",
+                parse_mode="HTML"
+            )
         return
 
     # --- Cleanup Confirmation Callbacks ---

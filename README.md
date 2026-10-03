@@ -12,6 +12,11 @@ Send Spotify, YouTube, or Amazon Music links directly in Telegram, and the bot a
   - **Spotify**: Tracks, Albums, Playlists (via `spotdl`).
   - **YouTube & YouTube Music**: Videos, Tracks, Playlists (via `yt-dlp`).
   - **Amazon Music**: Playlists and track links using an automated headless Chromium Playwright scraper that intercepts API payloads to extract complete tracklists.
+  - **Albums & Playlists**: Smart collection search that downloads every track individually with artwork and tags, generating `.m3u` playlists without stitched 1-hour jukebox files.
+- **In-Chat 30s Audio Previews**:
+  - Hear a 30-second audio sample with native waveform player right inside Telegram before downloading!
+  - Displays up to 10 clean studio tracks with full titles, all singers, duration, and album.
+  - One-tap button beneath the audio clip to download the full song directly to your library.
 - **Two-Tier Storage Lifecycle**:
   - `downloads/` (Staging): Temporary staging folder for new downloads, exploratory playlists, and automated discoveries.
   - `library/` (Permanent): Safe, permanent music collection.
@@ -19,7 +24,7 @@ Send Spotify, YouTube, or Amazon Music links directly in Telegram, and the bot a
 - **Automated Daily Discovery**:
   - Runs in the background (or on-demand via `/discover`).
   - Analyzes your Navidrome listening history (most played artists and starred tracks).
-  - Queries YouTube Music radio mixes to discover fresh songs you haven't heard yet.
+  - Queries YouTube Music official radio mixes to discover fresh studio songs you haven't heard yet.
   - Downloads 1 new song per day into `downloads/` and maintains a `Daily Discovery.m3u` playlist.
 - **Storage Cleanup & Space Management**:
   - Identifies tracks rated 1 star (⭐), tracks added to a `Delete` or `Trash` playlist in Navidrome, and unplayed staging tracks older than 14 days.
