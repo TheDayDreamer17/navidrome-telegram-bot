@@ -84,6 +84,19 @@ HELP_INLINE_KEYBOARD = InlineKeyboardMarkup([
 ])
 
 
+async def safe_edit_text(msg, text: str, **kwargs):
+    """Safely edits a message, falling back to sending a new message if editing is disallowed or fails."""
+    try:
+        return await msg.edit_text(text, **kwargs)
+    except Exception as e:
+        logger.warning(f"Could not edit message (id={getattr(msg, 'message_id', '?')}): {e}. Sending new message instead.")
+        try:
+            return await msg.reply_text(text, **kwargs)
+        except Exception as e2:
+            logger.error(f"Failed to reply as fallback: {e2}")
+            return None
+
+
 def get_user_paths(user_id: int) -> tuple[Path, Path, Path]:
     """Returns (user_root, downloads_dir, library_dir) for a user."""
     downloads_dir = USER_DIR_MAP[user_id]
@@ -581,7 +594,8 @@ async def download_album_or_playlist_job(kind: str, browse_id: str, user_id: int
     total_tracks = len(tracks)
 
     import html
-    await status_msg.edit_text(
+    await safe_edit_text(
+        status_msg,
         f"💿 <b>Found {kind.capitalize()}: '{html.escape(collection_title)}'</b> ({total_tracks} tracks).\n"
         f"⚡ Downloading individual studio songs into <code>downloads/</code>...",
         parse_mode="HTML"
@@ -602,14 +616,12 @@ async def download_album_or_playlist_job(kind: str, browse_id: str, user_id: int
             continue
 
         if idx % 2 == 0 or idx == 1 or idx == total_tracks:
-            try:
-                await status_msg.edit_text(
-                    f"⏳ Downloading <b>{html.escape(collection_title)}</b>: <b>{idx}/{total_tracks}</b> tracks...\n"
-                    f"Current: <i>{html.escape(q)}</i>",
-                    parse_mode="HTML"
-                )
-            except Exception:
-                pass
+            await safe_edit_text(
+                status_msg,
+                f"⏳ Downloading <b>{html.escape(collection_title)}</b>: <b>{idx}/{total_tracks}</b> tracks...\n"
+                f"Current: <i>{html.escape(q)}</i>",
+                parse_mode="HTML"
+            )
 
         if vid:
             ok, _, new_f = await loop.run_in_executor(None, download_specific_track, vid, downloads_dir)
@@ -692,10 +704,7 @@ async def download_direct_url_job(url: str, user_id: int, status_msg=None) -> tu
     # 2. AMAZON MUSIC
     elif "music.amazon." in url:
         if status_msg:
-            try:
-                await status_msg.edit_text("🔎 Extracting tracks from Amazon Music playlist...")
-            except Exception:
-                pass
+            await safe_edit_text(status_msg, "🔎 Extracting tracks from Amazon Music playlist...")
 
         pl_name, tracks = await scrape_amazon_music_playlist(url)
         if not tracks:
@@ -708,12 +717,10 @@ async def download_direct_url_job(url: str, user_id: int, status_msg=None) -> tu
 
         for i, track in enumerate(tracks, 1):
             if status_msg and (i == 1 or i % 3 == 0 or i == len(tracks)):
-                try:
-                    await status_msg.edit_text(
-                        f"⬇️ Syncing Amazon playlist '{pl_name}' ({i}/{len(tracks)}):\n🎵 {track}"
-                    )
-                except Exception:
-                    pass
+                await safe_edit_text(
+                    status_msg,
+                    f"⬇️ Syncing Amazon playlist '{pl_name}' ({i}/{len(tracks)}):\n🎵 {track}"
+                )
 
             existing_entry = find_existing_track_for_query(track, downloads_dir, library_dir)
             if existing_entry:
@@ -1184,12 +1191,11 @@ async def discover_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     status_msg = await update.message.reply_text(
-        "🎧 Analyzing your Navidrome listening history & finding a new track...",
-        reply_markup=MAIN_REPLY_KEYBOARD,
+        "🎧 Analyzing your Navidrome listening history & finding a new track..."
     )
     loop = asyncio.get_running_loop()
     success, msg = await loop.run_in_executor(None, discover_new_song_sync, user_id)
-    await status_msg.edit_text(msg, parse_mode="Markdown")
+    await safe_edit_text(status_msg, msg, parse_mode="Markdown")
 
 
 async def cleanup_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -1256,12 +1262,12 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     # 1. Direct Links (Spotify, Amazon Music, YouTube)
     if match:
         clean_url = match.group(0)
-        status_msg = await update.message.reply_text("⏳ Processing link... Please wait.", reply_markup=MAIN_REPLY_KEYBOARD)
+        status_msg = await update.message.reply_text("⏳ Processing link... Please wait.")
         success, log = await download_direct_url_job(clean_url, user_id, status_msg=status_msg)
         if success:
-            await status_msg.edit_text(f"✅ Done! {log}")
+            await safe_edit_text(status_msg, f"✅ Done! {log}")
         else:
-            await status_msg.edit_text(f"❌ Failed: {log}")
+            await safe_edit_text(status_msg, f"❌ Failed: {log}")
         return
 
     # 2. Text Search (Album/Playlist or Single Songs)
@@ -1270,7 +1276,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     # If user explicitly asked for an album/playlist, search collections first
     if is_album_query:
-        status_msg = await update.message.reply_text(f"🔎 Searching for Album/Playlist '{text}'...", reply_markup=MAIN_REPLY_KEYBOARD)
+        status_msg = await update.message.reply_text(f"🔎 Searching for Album/Playlist '{text}'...")
         loop = asyncio.get_running_loop()
         collections = await loop.run_in_executor(None, search_albums_and_playlists, text, 4)
 
@@ -1287,7 +1293,8 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
             col_keyboard.append([InlineKeyboardButton("🎵 Search Single Songs Instead", callback_data=f"search_songs:{text[:30]}")])
             col_keyboard.append([InlineKeyboardButton("❌ Cancel", callback_data="cancel")])
 
-            await status_msg.edit_text(
+            await safe_edit_text(
+                status_msg,
                 "\n".join(col_lines),
                 reply_markup=InlineKeyboardMarkup(col_keyboard),
                 parse_mode="HTML"
@@ -1295,12 +1302,12 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
             return
 
     # 3. Standard Clean Studio Songs Search (Up to 10 Songs with Previews)
-    status_msg = await update.message.reply_text(f"🔎 Searching YouTube Music for '{text}'...", reply_markup=MAIN_REPLY_KEYBOARD)
+    status_msg = await update.message.reply_text(f"🔎 Searching YouTube Music for '{text}'...")
     loop = asyncio.get_running_loop()
     candidates = await loop.run_in_executor(None, search_youtube_candidates, text, 10)
 
     if not candidates:
-        await status_msg.edit_text(f"❌ No clean studio tracks found for '{text}'.")
+        await safe_edit_text(status_msg, f"❌ No clean studio tracks found for '{text}'.")
         return
 
     context.user_data["candidates"] = {c["id"]: c for c in candidates}
@@ -1340,7 +1347,8 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         keyboard.append(prev_row2)
     keyboard.append([InlineKeyboardButton("❌ Cancel Search", callback_data="cancel")])
 
-    await status_msg.edit_text(
+    await safe_edit_text(
+        status_msg,
         "\n".join(msg_lines),
         reply_markup=InlineKeyboardMarkup(keyboard),
         parse_mode="HTML"
@@ -1424,9 +1432,9 @@ async def handle_button(update: Update, context: ContextTypes.DEFAULT_TYPE):
     # --- Album / Playlist Download Selection ---
     if data.startswith("dl_col:"):
         _, kind, browse_id = data.split(":", 2)
-        status_msg = await query.message.reply_text("⏳ Preparing album download...", reply_markup=MAIN_REPLY_KEYBOARD)
+        status_msg = await query.message.reply_text("⏳ Preparing album download...")
         result = await download_album_or_playlist_job(kind, browse_id, user_id, status_msg)
-        await status_msg.edit_text(result, parse_mode="HTML")
+        await safe_edit_text(status_msg, result, parse_mode="HTML")
         return
 
     # --- 30s Audio Preview Callback ---
@@ -1612,11 +1620,17 @@ async def post_init(app: Application):
     logger.info("Daily discovery & cleanup background scheduler initialized.")
 
 
+async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE) -> None:
+    logger.error("Exception while handling an update:", exc_info=context.error)
+
+
 def main():
     if not TELEGRAM_BOT_TOKEN:
         raise ValueError("Missing TELEGRAM_BOT_TOKEN environment variable.")
 
     app = ApplicationBuilder().token(TELEGRAM_BOT_TOKEN).post_init(post_init).build()
+
+    app.add_error_handler(error_handler)
 
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CommandHandler("help", help_command))
