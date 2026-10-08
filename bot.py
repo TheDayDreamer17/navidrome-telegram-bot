@@ -356,6 +356,13 @@ BAD_TITLE_PATTERNS = [
     r"\bnon\s*stop\b",
     r"\bjukebox\b",
     r"\bcompilation\b",
+    # Live concert / stage noise & clapping
+    r"\blive\s+(performance|concert|stage|show|recording|garba|video|session|version)\b",
+    r"\b(live\s+at|live\s+in)\b",
+    r"\bconcert\s+version\b",
+    r"\bstage\s+show\b",
+    r"\bground\s+garba\b",
+    r"\bnavratri\s+live\b",
 ]
 
 
@@ -381,21 +388,24 @@ def clean_display_title(title: str) -> str:
 # --- YouTube Music Search & Download Helpers ---
 def search_youtube_candidates(query: str, limit: int = 10) -> list[dict]:
     """
-    Searches YouTube Music for official studio songs, filtering out modified music videos.
+    Searches YouTube Music for official studio songs, strictly prioritizing
+    label-released studio tracks (ATV) over music videos with dialogue/acting.
     Returns up to 'limit' (default 10) results with full song title, singers, album, and duration.
     """
-    candidates: list[dict] = []
+    atv_candidates: list[dict] = []
+    other_candidates: list[dict] = []
 
     # 1. Primary: YouTube Music API (Clean Official Studio Songs)
     try:
         yt = YTMusic()
-        results = yt.search(query, filter="songs", limit=max(25, limit * 2))
+        results = yt.search(query, filter="songs", limit=max(30, limit * 3))
         for r in results:
             vid = r.get("videoId")
             title = (r.get("title") or "").strip()
             artists = ", ".join([a["name"] for a in r.get("artists", [])]) or "Unknown Artist"
             dur = r.get("duration") or "Unknown"
             album = r.get("album", {}).get("name") if r.get("album") else ""
+            vtype = r.get("videoType")
 
             if not vid or not title:
                 continue
@@ -418,19 +428,27 @@ def search_youtube_candidates(query: str, limit: int = 10) -> list[dict]:
                 except ValueError:
                     pass
 
-            candidates.append({
+            item = {
                 "id": vid,
                 "title": clean_display_title(title),
                 "artists": artists,
                 "channel": artists,
                 "album": album,
                 "duration": dur,
-            })
-            if len(candidates) >= limit:
+                "is_studio": (vtype == "MUSIC_VIDEO_TYPE_ATV"),
+            }
+
+            if vtype == "MUSIC_VIDEO_TYPE_ATV":
+                atv_candidates.append(item)
+            else:
+                other_candidates.append(item)
+
+            if len(atv_candidates) >= limit:
                 break
     except Exception as e:
         logger.warning(f"[Search] YTMusic search failed, falling back to yt-dlp: {e}")
 
+    candidates = (atv_candidates + other_candidates)[:limit]
     if candidates:
         return candidates
 
@@ -466,6 +484,7 @@ def search_youtube_candidates(query: str, limit: int = 10) -> list[dict]:
                     "channel": channel,
                     "album": "",
                     "duration": dur_str,
+                    "is_studio": False,
                 })
                 if len(candidates) >= limit:
                     break
@@ -486,6 +505,7 @@ def download_specific_track(video_id: str, target_dir: Path) -> tuple[bool, str,
         "--audio-quality", "0",
         "--embed-thumbnail",
         "--embed-metadata",
+        "--sponsorblock-remove", "music_offtopic,sponsor,intro,outro",
         "-o", str(target_dir / "%(artist,creator,uploader)s - %(title)s.%(ext)s"),
         url,
     ]
@@ -647,9 +667,51 @@ async def download_album_or_playlist_job(kind: str, browse_id: str, user_id: int
     )
 
 
+def resolve_best_studio_track(query: str) -> str | None:
+    """
+    Searches YouTube Music for the cleanest official studio recording.
+    Prioritizes MUSIC_VIDEO_TYPE_ATV (Audio Track Video / Official Album Audio)
+    which has zero dialogue, sponsor ads, or stage noise.
+    """
+    try:
+        yt = YTMusic()
+        clean_q = re.sub(r'[\(\[\{].*?[\)\]\}]', '', query).strip()
+        results = yt.search(clean_q or query, filter="songs", limit=12)
+
+        # 1. Strictly prioritize Official Audio Tracks (ATV)
+        for r in results:
+            vid = r.get("videoId")
+            title = r.get("title") or ""
+            artists = ", ".join([a["name"] for a in r.get("artists", [])]) if r.get("artists") else ""
+            if vid and r.get("videoType") == "MUSIC_VIDEO_TYPE_ATV" and is_clean_studio_track(title, artists, query):
+                logger.info(f"[Studio Resolve] Matched pristine ATV studio master: '{artists} - {title}' ({vid}) for query '{query}'")
+                return vid
+
+        # 2. Fallback to clean studio track from song filter
+        for r in results:
+            vid = r.get("videoId")
+            title = r.get("title") or ""
+            artists = ", ".join([a["name"] for a in r.get("artists", [])]) if r.get("artists") else ""
+            if vid and is_clean_studio_track(title, artists, query):
+                logger.info(f"[Studio Resolve] Matched clean song fallback: '{artists} - {title}' ({vid}) for query '{query}'")
+                return vid
+    except Exception as e:
+        logger.warning(f"[Studio Resolve] Failed to resolve studio track for '{query}': {e}")
+    return None
+
+
 def download_ytsearch_single(track_query: str, target_dir: Path) -> list[str]:
-    """Downloads 1 track via ytsearch1 and returns any newly created file names."""
+    """Downloads 1 track, prioritizing official studio masters (ATV) and removing video filler with SponsorBlock."""
+    # 1. Try resolving to a clean official studio track first
+    best_vid = resolve_best_studio_track(track_query)
+    if best_vid:
+        ok, _, new_files = download_specific_track(best_vid, target_dir)
+        if ok and new_files:
+            return new_files
+
+    # 2. Fallback to ytsearch with SponsorBlock trimming
     before = list_audio_files(target_dir)
+    clean_q = re.sub(r'[\(\[\{].*?[\)\]\}]', '', track_query).strip()
     cmd = [
         "yt-dlp",
         "-x",
@@ -657,8 +719,9 @@ def download_ytsearch_single(track_query: str, target_dir: Path) -> list[str]:
         "--audio-quality", "0",
         "--embed-thumbnail",
         "--embed-metadata",
+        "--sponsorblock-remove", "music_offtopic,sponsor,intro,outro",
         "-o", str(target_dir / "%(artist,creator,uploader)s - %(title)s.%(ext)s"),
-        f"ytsearch1:{track_query}",
+        f"ytsearch1:{clean_q} official audio",
     ]
     subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
     after = list_audio_files(target_dir)
