@@ -502,6 +502,7 @@ def download_specific_track(video_id: str, target_dir: Path) -> tuple[bool, str,
     url = f"https://www.youtube.com/watch?v={video_id}"
     cmd = [
         "yt-dlp",
+        "--extractor-args", "youtube:player_client=android,web",
         "-x",
         "--audio-format", "mp3",
         "--audio-quality", "0",
@@ -716,6 +717,7 @@ def download_ytsearch_single(track_query: str, target_dir: Path) -> list[str]:
     clean_q = re.sub(r'[\(\[\{].*?[\)\]\}]', '', track_query).strip()
     cmd = [
         "yt-dlp",
+        "--extractor-args", "youtube:player_client=android,web",
         "-x",
         "--audio-format", "mp3",
         "--audio-quality", "0",
@@ -839,6 +841,7 @@ async def download_direct_url_job(url: str, user_id: int, status_msg=None) -> tu
             clean_pl_name = sanitize_filename(pl_name)
             cmd = [
                 "yt-dlp",
+                "--extractor-args", "youtube:player_client=android,web",
                 "-x",
                 "--audio-format", "mp3",
                 "--audio-quality", "0",
@@ -864,6 +867,7 @@ async def download_direct_url_job(url: str, user_id: int, status_msg=None) -> tu
         else:
             cmd = [
                 "yt-dlp",
+                "--extractor-args", "youtube:player_client=android,web",
                 "-x",
                 "--audio-format", "mp3",
                 "--audio-quality", "0",

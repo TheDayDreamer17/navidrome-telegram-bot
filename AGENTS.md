@@ -97,3 +97,16 @@ The user has strict requirements regarding audio quality and presentation:
 3. **Communication**:
    - Always explain to the user clearly what was changed, why, and how it behaves before proposing commits or pushes.
    - Keep this `AGENTS.md` updated as new user decisions and features are introduced.
+
+---
+
+## 🎓 5. Mentorship & Active Learning Protocol (CRITICAL)
+
+The user wants to actively learn system architecture and engineering practices throughout every task:
+1. **Autonomous Research**: Run read-only searches, database queries, and diagnostics automatically without prompting for permission.
+2. **Technical Diagnosis First**: Always explain:
+   - **What was found** (the problem).
+   - **How it was found** (exact queries, tools, and technical mechanisms used).
+3. **Approach Options & Trade-offs**: Present 2–3 architectural approaches with pros/cons before writing/modifying code or changing system state.
+4. **Interactive Alignment**: Discuss the solution and ask questions so the user decides the direction and builds engineering knowledge for their resume.
+5. **No Blind State Changes**: Do not overwrite files, alter databases, or push commits until the approach is agreed upon.
