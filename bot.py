@@ -1029,22 +1029,64 @@ def find_cleanup_candidates(user_id: int) -> list[dict]:
     return list(candidates.values())
 
 
+def load_discovery_history(user_dir: Path) -> dict:
+    history_file = user_dir / ".discovery_history.json"
+    if history_file.exists():
+        try:
+            return json.loads(history_file.read_text(encoding="utf-8"))
+        except Exception:
+            pass
+    return {"recent_seeds": [], "recent_artists": []}
+
+
+def save_discovery_history(user_dir: Path, history: dict):
+    history_file = user_dir / ".discovery_history.json"
+    try:
+        history_file.write_text(json.dumps(history, indent=2, ensure_ascii=False), encoding="utf-8")
+    except Exception as e:
+        logger.warning(f"Could not save discovery history: {e}")
+
+
+def clean_seed_query_and_display(artist: str, title: str) -> tuple[str, str]:
+    """Cleans noisy YouTube title text for search queries and UI display."""
+    t = clean_display_title(title or "")
+    first_part = t.split("|")[0].split("｜")[0].strip()
+    first_part = re.sub(r"[\(\[\{].*?[\)\]\}]", "", first_part).strip()
+    clean_t = re.sub(r'\b(official\s+video|full\s+video|video\s+song|lyrics?|full\s+audio\s+song)\b', '', first_part, flags=re.IGNORECASE).strip()
+
+    clean_a = re.split(r'[\│\|\─\–\-,]', artist or "")[0].strip()
+    clean_a = re.sub(r"[\(\[\{].*?[\)\]\}]", "", clean_a).strip()
+
+    if clean_a.lower() in clean_t.lower():
+        display = clean_t
+    elif clean_a and clean_t:
+        display = f"{clean_a} - {clean_t}"
+    else:
+        display = clean_t or clean_a
+    query = f"{clean_a} {clean_t}".strip() if clean_a and clean_t else (clean_t or clean_a)
+    return query, display
+
+
 def discover_new_song_sync(user_id: int) -> tuple[bool, str]:
     """
-    Picks a seed song from the user's Navidrome Starred / Top Played tracks,
-    queries YouTube Music Radio Mix (RD<video_id>), filters out existing library songs,
-    downloads 1 new song into downloads/, and adds it to 'Daily Discovery.m3u'.
+    Picks a diverse seed song from the user's Navidrome library across rotating artists/genres,
+    preventing feedback loops where the same artist is recommended every day.
     """
     user_root, downloads_dir, library_dir = get_user_paths(user_id)
     existing_files = list_audio_files(downloads_dir) | list_audio_files(library_dir)
     existing_norms = {normalize_text(f.stem) for f in existing_files}
 
-    seed_tracks: list[str] = []
+    history = load_discovery_history(downloads_dir)
+    recent_seeds = history.get("recent_seeds", [])
+    recent_artists = history.get("recent_artists", [])
+
+    candidate_seeds: list[dict] = []
     conn = get_navidrome_conn()
     if conn:
         try:
             lib_id = get_navidrome_library_id(conn, user_root)
             if lib_id is not None:
+                # Group by artist to force genre and artist diversity across the entire library
                 q_seeds = """
                     SELECT m.artist, m.title,
                            MAX(COALESCE(a.starred, 0)) AS is_starred,
@@ -1053,43 +1095,68 @@ def discover_new_song_sync(user_id: int) -> tuple[bool, str]:
                     FROM media_file m
                     LEFT JOIN annotation a ON a.item_id = m.id AND a.item_type = 'media_file'
                     WHERE m.library_id = ? AND m.missing = 0
-                    GROUP BY m.id
-                    ORDER BY is_starred DESC, max_rating DESC, plays DESC, RANDOM()
-                    LIMIT 15
+                      AND (m.path NOT LIKE 'downloads/%' OR a.starred = 1 OR a.rating >= 4 OR a.play_count >= 2)
+                    GROUP BY m.artist
+                    ORDER BY is_starred DESC, plays DESC, RANDOM()
                 """
                 for r in conn.execute(q_seeds, (lib_id,)).fetchall():
-                    artist = (r["artist"] or "").strip()
-                    title = (r["title"] or "").strip()
-                    if artist and title and artist.lower() != "unknown artist":
-                        seed_tracks.append(f"{artist} - {title}")
-                    elif title:
-                        seed_tracks.append(title)
-                    existing_norms.add(normalize_text(f"{artist} {title}"))
-                    existing_norms.add(normalize_text(title))
+                    art = (r["artist"] or "").strip()
+                    tit = (r["title"] or "").strip()
+                    if art and tit and art.lower() != "unknown artist":
+                        candidate_seeds.append({
+                            "artist": art,
+                            "title": tit,
+                            "starred": r["is_starred"],
+                            "plays": r["plays"]
+                        })
         except Exception as e:
             logger.error(f"[Discover] DB query error: {e}")
         finally:
             conn.close()
 
-    if not seed_tracks:
-        seed_tracks = [f.stem for f in existing_files]
+    # Fallback to distinct files on disk if DB returned nothing
+    if not candidate_seeds:
+        for f in existing_files:
+            parts = f.stem.split(" - ", 1)
+            if len(parts) == 2:
+                candidate_seeds.append({"artist": parts[0].strip(), "title": parts[1].strip(), "starred": 0, "plays": 0})
+            else:
+                candidate_seeds.append({"artist": "", "title": f.stem, "starred": 0, "plays": 0})
 
-    if not seed_tracks:
+    if not candidate_seeds:
         return False, "Your library is empty! Download a few songs first so I can learn your taste."
 
-    top_pool = seed_tracks[: min(8, len(seed_tracks))]
-    random.shuffle(top_pool)
+    # Filter out seeds or artists that were used recently (last 10 cycles)
+    fresh_seeds = [
+        s for s in candidate_seeds
+        if s["artist"].lower() not in [ra.lower() for ra in recent_artists]
+        and normalize_text(f"{s['artist']} {s['title']}") not in [normalize_text(rs) for rs in recent_seeds]
+    ]
+
+    # If all library artists were recently sampled, reset the cycle
+    if not fresh_seeds:
+        logger.info("[Discover] All library artists recently sampled. Resetting seed history cycle.")
+        fresh_seeds = candidate_seeds
+        recent_seeds = []
+        recent_artists = []
+
+    # Shuffle fresh seeds across distinct artists
+    random.shuffle(fresh_seeds)
 
     yt = YTMusic()
-    for seed in top_pool:
-        logger.info(f"[Discover] Trying seed track: '{seed}'")
+    for seed_item in fresh_seeds:
+        raw_art = seed_item["artist"]
+        raw_tit = seed_item["title"]
+        search_q, display_seed = clean_seed_query_and_display(raw_art, raw_tit)
+
+        logger.info(f"[Discover] Trying diverse seed: '{display_seed}' (query: '{search_q}')")
         try:
-            seed_results = yt.search(seed, filter="songs", limit=3)
+            seed_results = yt.search(search_q, filter="songs", limit=5)
             if not seed_results or not seed_results[0].get("videoId"):
                 continue
 
             seed_vid = seed_results[0]["videoId"]
-            watch = yt.get_watch_playlist(videoId=seed_vid, limit=30)
+            watch = yt.get_watch_playlist(videoId=seed_vid, limit=40)
             raw_tracks = watch.get("tracks", [])
             if not raw_tracks:
                 continue
@@ -1097,7 +1164,12 @@ def discover_new_song_sync(user_id: int) -> tuple[bool, str]:
             candidates = raw_tracks[1:] if len(raw_tracks) > 1 else raw_tracks
             random.shuffle(candidates)
 
-            for entry in candidates:
+            # Prioritize ATV (pure studio master) recommendations
+            atv_cands = [c for c in candidates if c.get("videoType") == "MUSIC_VIDEO_TYPE_ATV"]
+            other_cands = [c for c in candidates if c.get("videoType") != "MUSIC_VIDEO_TYPE_ATV"]
+            ordered_cands = atv_cands + other_cands
+
+            for entry in ordered_cands:
                 vid = entry.get("videoId")
                 title = clean_display_title((entry.get("title") or "").strip())
                 artists = ", ".join([a["name"] for a in entry.get("artists", [])]) or "Unknown Artist"
@@ -1109,6 +1181,10 @@ def discover_new_song_sync(user_id: int) -> tuple[bool, str]:
                 if not is_clean_studio_track(title, artists):
                     continue
 
+                # Don't recommend the same artist that was recommended in the last 5 days
+                if artists.lower() in [ra.lower() for ra in recent_artists[:5]]:
+                    continue
+
                 norm_title = normalize_text(title)
                 norm_full = normalize_text(f"{artists} {title}")
                 if any(
@@ -1118,11 +1194,23 @@ def discover_new_song_sync(user_id: int) -> tuple[bool, str]:
                 ):
                     continue
 
-                logger.info(f"[Discover] Selected clean recommendation: '{artists} - {title}' ({vid}) from seed '{seed}'")
+                logger.info(f"[Discover] Selected clean recommendation: '{artists} - {title}' ({vid}) from seed '{display_seed}'")
                 ok, err, new_files = download_specific_track(vid, downloads_dir)
                 if ok and new_files:
                     for nf in new_files:
                         append_to_m3u_playlist("Daily Discovery", downloads_dir, nf)
+
+                    # Update and persist history
+                    recent_seeds.append(display_seed)
+                    recent_artists.append(raw_art)
+                    if len(recent_seeds) > 15:
+                        recent_seeds = recent_seeds[-15:]
+                    if len(recent_artists) > 15:
+                        recent_artists = recent_artists[-15:]
+                    history["recent_seeds"] = recent_seeds
+                    history["recent_artists"] = recent_artists
+                    save_discovery_history(downloads_dir, history)
+
                     album_str = f" • 💿 _{album}_" if album else ""
                     dur_str = f"⏱️ {dur}" if dur else ""
                     details = f"{dur_str}{album_str}".strip(" • ")
@@ -1130,7 +1218,7 @@ def discover_new_song_sync(user_id: int) -> tuple[bool, str]:
                     return (
                         True,
                         f"✨ **New Discovery Added!**\n\n"
-                        f"🎧 **Based on your taste:** _{seed}_\n"
+                        f"🎧 **Based on your taste:** _{display_seed}_\n"
                         f"🎵 **Song:** **{title}**\n"
                         f"🎤 **Singer(s):** *{artists}*\n"
                         f"{details_line}"
@@ -1138,7 +1226,7 @@ def discover_new_song_sync(user_id: int) -> tuple[bool, str]:
                         f"💡 _Tip: ❤️ Star it in Navidrome to move to permanent `library/`, or rate 1⭐ to remove._",
                     )
         except Exception as e:
-            logger.warning(f"[Discover] Error querying radio for seed '{seed}': {e}")
+            logger.warning(f"[Discover] Error querying radio for seed '{display_seed}': {e}")
             continue
 
     return False, "Could not find a new recommendation right now. Try again later!"
