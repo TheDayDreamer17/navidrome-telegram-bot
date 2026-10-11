@@ -132,6 +132,8 @@ def create_m3u_playlist(playlist_name: str, target_dir: Path, audio_entries: lis
         f.write("#EXTM3U\n")
         for entry in audio_entries:
             f.write(f"{entry}\n")
+    sync_navidrome_playlist_ownership()
+    schedule_delayed_playlist_sync()
 
 
 def append_to_m3u_playlist(playlist_name: str, target_dir: Path, audio_entry: str):
@@ -894,6 +896,73 @@ def get_navidrome_conn() -> sqlite3.Connection | None:
         return None
 
 
+def get_navidrome_rw_conn() -> sqlite3.Connection | None:
+    if not NAVIDROME_DB_PATH.exists():
+        logger.warning(f"[Navidrome DB] Not found at {NAVIDROME_DB_PATH}")
+        return None
+    try:
+        conn = sqlite3.connect(str(NAVIDROME_DB_PATH), timeout=10)
+        conn.row_factory = sqlite3.Row
+        return conn
+    except Exception as e:
+        logger.error(f"[Navidrome DB] Failed to open DB (rw): {e}")
+        return None
+
+
+def sync_navidrome_playlist_ownership() -> int:
+    """
+    Ensures .m3u playlists imported by Navidrome are owned by their respective
+    user account (e.g. /music/vismay/... -> vismay, /music/dimpal/... -> dimpal)
+    instead of defaulting to the admin account.
+    """
+    conn = get_navidrome_rw_conn()
+    if not conn:
+        return 0
+    try:
+        cur = conn.cursor()
+        users = cur.execute("SELECT id, user_name FROM user").fetchall()
+        user_map = {row["user_name"]: row["id"] for row in users}
+
+        total_updated = 0
+        for uname, uid in user_map.items():
+            if not uname:
+                continue
+            pattern = f"%/{uname}/%"
+            cur.execute(
+                """
+                UPDATE playlist
+                SET owner_id = ?
+                WHERE path LIKE ? AND owner_id != ?
+                """,
+                (uid, pattern, uid),
+            )
+            total_updated += cur.rowcount
+
+        conn.commit()
+        if total_updated > 0:
+            logger.info(f"[Navidrome Sync] Assigned ownership of {total_updated} playlist(s) to respective user account(s).")
+        return total_updated
+    except Exception as e:
+        logger.error(f"[Navidrome Sync] Error syncing playlist ownership: {e}")
+        return 0
+    finally:
+        conn.close()
+
+
+def schedule_delayed_playlist_sync():
+    """Schedules follow-up sync checks after 5s and 15s to catch Navidrome watcher imports."""
+    try:
+        loop = asyncio.get_running_loop()
+        async def _delayed():
+            await asyncio.sleep(5)
+            await loop.run_in_executor(None, sync_navidrome_playlist_ownership)
+            await asyncio.sleep(10)
+            await loop.run_in_executor(None, sync_navidrome_playlist_ownership)
+        asyncio.create_task(_delayed())
+    except RuntimeError:
+        pass
+
+
 def get_navidrome_library_id(conn: sqlite3.Connection, user_root: Path) -> int | None:
     cur = conn.execute("SELECT id, path FROM library")
     for row in cur.fetchall():
@@ -1235,6 +1304,9 @@ def discover_new_song_sync(user_id: int) -> tuple[bool, str]:
 # --- Telegram Lifecycle & Cleanup Prompt Helper ---
 async def run_user_lifecycle_and_notify(app: Application, user_id: int, manual: bool = False):
     loop = asyncio.get_running_loop()
+
+    # 0. Sync playlist ownership in Navidrome DB
+    await loop.run_in_executor(None, sync_navidrome_playlist_ownership)
 
     # 1. Promote Starred / 4-5⭐ tracks from downloads/ to library/
     promoted = await loop.run_in_executor(None, promote_starred_to_library, user_id)
@@ -1749,6 +1821,17 @@ async def daily_background_worker(app: Application):
                 logger.error(f"[Scheduler] Error for user {uid}: {e}")
 
 
+async def periodic_playlist_sync_worker():
+    """Periodically verifies and assigns newly imported .m3u playlists to their user accounts."""
+    while True:
+        try:
+            loop = asyncio.get_running_loop()
+            await loop.run_in_executor(None, sync_navidrome_playlist_ownership)
+        except Exception as e:
+            logger.error(f"[PlaylistWorker] Error during sync: {e}")
+        await asyncio.sleep(60)
+
+
 async def post_init(app: Application):
     for uid in USER_DIR_MAP:
         get_user_paths(uid)
@@ -1767,8 +1850,12 @@ async def post_init(app: Application):
     except Exception as e:
         logger.warning(f"Could not register Bot Commands: {e}")
 
+    # Immediately align all existing .m3u playlists to their folder owner
+    sync_navidrome_playlist_ownership()
+
     asyncio.create_task(daily_background_worker(app))
-    logger.info("Daily discovery & cleanup background scheduler initialized.")
+    asyncio.create_task(periodic_playlist_sync_worker())
+    logger.info("Daily lifecycle and periodic playlist sync background schedulers initialized.")
 
 
 async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE) -> None:
